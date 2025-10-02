@@ -160,9 +160,7 @@ class BotSettings:
             return
 
         # Attempt login
-        sub = await tidalapi.login_from_saved(data)
-        if sub:
-            LOGGER.info(f"TIDAL: Successfully loaded account - {sub}")
+        await tidalapi.login_from_saved(data)
         
         # Set audio quality
         quality, _ = set_db.get_variable('TIDAL_QUALITY')
