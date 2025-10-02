@@ -5,44 +5,37 @@ import aiolimiter
 from datetime import datetime, timedelta
 
 from config import Config
-
 from bot.logger import LOGGER
 
 # from orpheusdl-tidal
 
-TIDAL_CLIENT_VERSION = '2.26.1'
 
 class TidalApi:
     def __init__(self):
         self.TIDAL_API_BASE = 'https://api.tidal.com/v1/'
         
         self.ratelimit = aiolimiter.AsyncLimiter(30, 60)
+        self.session: aiohttp.ClientSession | None = None
 
-        self.tv_session = None
-        self.mobile_hires = None
-        self.mobile_atmos = None
+        self.tv_session: TvSession | None = None
+        self.mobile_hires: MobileSession | None = None
+        self.mobile_atmos: MobileSession | None = None
 
         self.quality = 'LOW'
         self.spatial = 'OFF'
+        self.sub_type: str | None = None
         
-
         self.saved = [] # just for storing opened client session
 
-        self.sub_type = None
 
-
-
-    async def _get(self, url, params=None, session=None, refresh=False):
-        if params is None:
-            params = {}
-
+    async def _get(self, url: str, params: dict | None = None, session=None, refresh=False):
         # if no session is given, use the first one (default)
         if session is None:
             session = self.saved[0]
 
-        params['countryCode'] = session.country_code
-        if 'limit' not in params:
-            params['limit'] = '9999'
+        params = params or {}
+        params.setdefault("countryCode", session.country_code)
+        params.setdefault("limit", "9999")
 
 
         async with self.ratelimit:
@@ -61,14 +54,6 @@ class TidalApi:
                 try:
                     resp_json = await resp.json()
                 except:  # some tracks seem to return a JSON with leading whitespace
-                    pass
-                    """try:
-                        #resp_json = json.loads(resp.text.strip())
-                        
-                    except:  # if this doesn't work, the HTTP status probably isn't 200. Are we rate limited?
-                        pass"""
-
-                if not resp_json:
                     raise Exception(f'TIDAL : Response was not valid JSON. HTTP status {resp.status}. {resp.text}')
 
                 if 'status' in resp_json and resp_json['status'] == 404 and \
@@ -119,15 +104,9 @@ class TidalApi:
 
     # call this from bot settings panel only
     async def get_tv_login_url(self):
-        """
-        Get URL for loggin in using webbrowser
-        Returns:
-            auth_url: URL for authorization
-            error: if any error occured
-        """
         self.session = aiohttp.ClientSession()
 
-        if Config.TIDAL_TV_TOKEN is None and Config.TIDAL_TV_SECRET is None:
+        if not (Config.TIDAL_TV_TOKEN and Config.TIDAL_TV_SECRET):
             return False, "No Token/Secret added"
 
         self.tv_session = TvSession(
@@ -144,21 +123,14 @@ class TidalApi:
 
 
     async def login_tv(self):
-        """
-        Needs device code to be fetched before
-        Returns:
-            sub:(str) subscription type: if login successfull
-                (bool) False: if login failed
-            err: error if any
-        """
         try:
             await self.tv_session.auth()
             self.saved.append(self.tv_session)
+
             self.sub_type = await self.get_subscription()
             LOGGER.info(f"TIDAL : Loaded account - {self.sub_type}")
 
             await self.refresh_mobile()
-
             return self.sub_type, None
         except Exception as e: 
             await self.session.close()
@@ -181,57 +153,47 @@ class TidalApi:
         try:
             await self.tv_session.refresh()
             self.saved.append(self.tv_session)
-            tv_session = True
         except Exception as e: 
-            tv_session = False
+            self.tv_session = None
             LOGGER.error("TIDAL : Coudn't load TV/Auto - " + str(e))
 
         # even if tv login failes check for mobile (if set to use mobile)
         await self.refresh_mobile()
 
-        # remove tv session if not authed
-        if not tv_session:
-            self.tv_session = None
-
-        if self.tv_session.user_id or self.mobile_atmos.user_id or self.mobile_hires.user_id:
+        if any([self.tv_session, self.mobile_hires, self.mobile_atmos]):
             self.sub_type = await self.get_subscription()
         else:
             self.sub_type = 'UNKNOWN'
 
-        return self.sub_type
+        LOGGER.info(f"TIDAL : Loaded account - {self.sub_type}")
     
 
     async def refresh_mobile(self, data=None):
-        if Config.TIDAL_MOBILE:
-            if Config.TIDAL_MOBILE_TOKEN:
-                self.mobile_hires = MobileSession(Config.TIDAL_MOBILE_TOKEN, self.session)
-                self.mobile_hires.country_code = self.tv_session.country_code
-                self.mobile_hires.refresh_token = self.tv_session.refresh_token
-                self.mobile_hires.user_id = self.tv_session.user_id 
-                try:
-                    await self.mobile_hires.refresh()
-                    self.saved.append(self.mobile_hires)
-                except Exception as e: 
-                    self.mobile_hires = None
-                    LOGGER.error("TIDAL : Coudn't load Mobile Hires - " + str(e))
+        if not Config.TIDAL_MOBILE:
+            return
 
-            if Config.TIDAL_ATMOS_MOBILE_TOKEN:
-                self.mobile_atmos = MobileSession(Config.TIDAL_ATMOS_MOBILE_TOKEN, self.session)
-                self.mobile_atmos.country_code = self.tv_session.country_code
-                self.mobile_atmos.refresh_token = self.tv_session.refresh_token
-                self.mobile_atmos.user_id = self.tv_session.user_id 
-                try:
-                    await self.mobile_atmos.refresh()
-                    self.saved.append(self.mobile_atmos)
-                except Exception as e: 
-                    self.mobile_atmos = None
-                    LOGGER.error("TIDAL : Coudn't load Mobile Atmos - " + str(e))
+        if Config.TIDAL_MOBILE_TOKEN:
+            self.mobile_hires = await self._init_mobile_session(Config.TIDAL_MOBILE_TOKEN, 'Hires')
+
+
+        if Config.TIDAL_ATMOS_MOBILE_TOKEN:
+            self.mobile_atmos = await self._init_mobile_session(Config.TIDAL_ATMOS_MOBILE_TOKEN, 'Atmos')
+
+
+    async def _init_mobile_session(self, token: str, device: str) -> "MobileSession | None":
+        session = MobileSession(token, self.session)
+        session.copy_from(self.tv_session)
+        try:
+            await session.refresh()
+            self.saved.append(session)
+            return session
+        except Exception as e:
+            LOGGER.error(f"TIDAL: Couldn't load Mobile {device} session - {e}")
+            return None
+
 
 
     async def get_subscription(self) -> str:
-        """
-        pick a session and fetch the subscription
-        """
         if self.saved != []:
             usersess = self.saved[0]
             async with self.session.get(f'https://api.tidal.com/v1/users/{usersess.user_id}/subscription',
@@ -242,45 +204,58 @@ class TidalApi:
                 if r.status != 200:
                     raise Exception(f"TIDAL : {json_resp['userMessage']}")
                 return json_resp['subscription']['type']
-        
 
-class MobileSession():
-    """
-    Args
-        token: hires/atmos mobile token (str)
-        session: aiohttp session
-    """
-    def __init__(self, token, session):
+
+
+class BaseSession:
+    AUTH_BASE = "https://auth.tidal.com/v1/"
+
+    def __init__(self, session: aiohttp.ClientSession):
         self.session = session
+        self.user_id: str | None = None
+        self.country_code: str | None = None
+        self.access_token: str | None = None
+        self.refresh_token: str | None = None
+        self.expires: datetime | None = None
 
-        self.client_id = token
-        self.user_id = None
-        self.country_code = None
-        self.access_token = None
-        self.refresh_token = None
+    def copy_from(self, other: "BaseSession"):
+        self.country_code = other.country_code
+        self.refresh_token = other.refresh_token
+        self.user_id = other.user_id
 
-        self.TIDAL_AUTH_BASE = 'https://auth.tidal.com/v1/'
+    def auth_headers(self) -> dict:
+        raise NotImplementedError
 
     async def refresh(self):
-        assert (self.refresh_token is not None)
-        assert (self.client_id is not None)
+            raise NotImplementedError
 
-        async with self.session.post(self.TIDAL_AUTH_BASE + 'oauth2/token', data={
-            'refresh_token': self.refresh_token,
-            'client_id': self.client_id,
-            'grant_type': 'refresh_token'
-        }) as r:
+        
+
+class MobileSession(BaseSession):
+    def __init__(self, token: str, session: aiohttp.ClientSession):
+        super().__init__(session)
+        self.client_id = token
+
+
+    async def refresh(self):
+        if not self.refresh_token:
+            raise Exception("TIDAL: Missing refresh token for MobileSession")
+
+        async with self.session.post(
+            self.AUTH_BASE + 'oauth2/token', 
+            data={
+                'refresh_token': self.refresh_token,
+                'client_id': self.client_id,
+                'grant_type': 'refresh_token'
+            }
+        ) as r:
             json_resp = await r.json()
             if r.status == 200:
                 # get user_id in case of direct refresh token login
-                if not self.user_id:
-                    self.user_id = json_resp['user_id']
+                self.user_id = self.user_id or data["user_id"]
                 self.access_token = json_resp['access_token']
                 self.expires = datetime.now() + timedelta(seconds=json_resp['expires_in'])
-
-                if 'refresh_token' in json_resp:
-                    self.refresh_token = json_resp['refresh_token']
-
+                self.refresh_token = json_resp.get("refresh_token", self.refresh_token)
             elif r.status == 401:
                 raise Exception('TIDAL : ' + json_resp['userMessage'])
 
@@ -296,58 +271,35 @@ class MobileSession():
         }
 
 
-class TvSession():
-    """
-    Args
-        token: tv token (str)
-        secret: tv secret (str)
-        session: aiohttp session
-    """
-    def __init__(self, token, secret, session):
-        self.TIDAL_AUTH_BASE = 'https://auth.tidal.com/v1/'
-        
+class TvSession(BaseSession):
+    def __init__(self, token: str, secret: str, session: aiohttp.ClientSession):
+        super().__init__(session)
+        self.client_id = token
+        self.client_secret = secret
+        self.temp_data: dict | None = None
 
-        self.client_id = token 
-        self.client_secret = secret 
-        self.access_token = None
-        self.refresh_token = None
-        self.expires = None
-        self.user_id = None
-        self.country_code = None
-        self.temp_data = None
-
-        # link expiry from tidal
-        #self.login_timeout = None
-        # url login check
-        #self.login_chk_interval = None
-
-        self.session = session
 
     async def get_device(self):
-        async with self.session.post(self.TIDAL_AUTH_BASE + 'oauth2/device_authorization', data={
-                'client_id': self.client_id,
-                'scope': 'r_usr w_usr'
-            }
+        async with self.session.post(
+            self.AUTH_BASE + 'oauth2/device_authorization', 
+            data={'client_id': self.client_id, 'scope': 'r_usr w_usr'}
         ) as r:
             if r.status != 200:
                 raise Exception("TIDAL : Invalid TV Client ID or Token")
-            else:
-                json_resp = await r.json()
-                device_code = json_resp['deviceCode']
-                user_code = json_resp['userCode']
-                #self.login_chk_interval = json_resp['interval']
-                #self.login_timeout = json_resp['expiresIn']
-                auth_link = f"https://link.tidal.com/{user_code}"
 
-        self.temp_data = {
-            'client_id': self.client_id,
-            'device_code': device_code,
-            'client_secret': self.client_secret,
-            'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
-            'scope': 'r_usr w_usr'
-        }
+            json_resp = await r.json()
+            auth_link = f"https://link.tidal.com/{json_resp['userCode']}"
 
-        return auth_link
+            self.temp_data = {
+                'client_id': self.client_id,
+                'device_code': json_resp['deviceCode'],
+                'client_secret': self.client_secret,
+                'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+                'scope': 'r_usr w_usr'
+            }
+
+            return auth_link
+
 
     async def auth(self):
         # keep a timer - not causing infinite wait
@@ -363,11 +315,8 @@ class TvSession():
             i+=1
 
         json_resp = await r.json()
-        r.close()
 
-        if status_code == 200:
-            pass
-        else:
+        if status_code != 200:
             raise Exception(f"TIDAL : Auth error - {json_resp['error']}")
 
         self.access_token = json_resp['access_token']
@@ -387,29 +336,27 @@ class TvSession():
 
 
     async def refresh(self):
-        # checks before refreshing
-        assert (self.refresh_token is not None)
-        assert (self.client_id is not None)
+        if not self.refresh_token:
+            raise Exception("TIDAL: Missing refresh token for TvSession")
 
-        async with self.session.post(self.TIDAL_AUTH_BASE + 'oauth2/token', data={
-            'refresh_token': self.refresh_token,
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'grant_type': 'refresh_token'
-        }) as r:
+        async with self.session.post(
+            self.AUTH_BASE + 'oauth2/token', 
+            data={
+                'refresh_token': self.refresh_token,
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'grant_type': 'refresh_token'
+            }
+        ) as r:
             json_resp = await r.json()
-            if r.status == 200:
-                # get user_id in case of direct refresh token login
-                if not self.user_id:
-                    self.user_id = json_resp['user_id']
-                self.access_token = json_resp['access_token']
-                self.expires = datetime.now() + timedelta(seconds=json_resp['expires_in'])
+            if r.status != 200:
+                raise Exception(f"TIDAL: TV refresh failed - {json_resp.get('userMessage')}")
 
-                if 'refresh_token' in json_resp:
-                    self.refresh_token = json_resp['refresh_token']
-
-            elif r.status == 401:
-                raise Exception('TIDAL : TV/Auto refreshing failed - ' + json_resp['userMessage'])
+            # get user_id in case of direct refresh token login
+            self.user_id = self.user_id or json_resp["user_id"]
+            self.access_token = json_resp['access_token']
+            self.expires = datetime.now() + timedelta(seconds=json_resp['expires_in'])
+            self.refresh_token = json_resp.get("refresh_token", self.refresh_token)
 
 
     def auth_headers(self):
